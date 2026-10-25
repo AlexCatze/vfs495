@@ -3,31 +3,27 @@
 //! Once the handshake completes, the sensor speaks plain SSLv3 AppData records
 //! (`17 03 00 <len> <ct>`) directly on EP1 — no tunnel — and streams the
 //! plaintext image on EP2. Capture is armed by replaying the exact in-session
-//! command sequence observed from HP's binary (`captures/capture_seq.json`, a
+//! command sequence observed from HP's binary (`data/<model>/capture_seq.json`, a
 //! list of plaintext-command hex strings; device-specific, gitignored — extract
-//! it from an HP trace as documented in the README). Each command is re-encrypted
-//! with *our* session keys, so no HP-generated ciphertext is reused.
+//! it from an HP trace with `tools/`). Each command is re-encrypted with *our*
+//! session keys, so no HP-generated ciphertext is reused. The per-model indices
+//! of the setup/imaging/finish ranges live in [`crate::device`].
 
 use crate::crypto::Record;
+use crate::device::Calib;
+use crate::session::Config;
 use crate::usb::Sensor;
 use anyhow::{Context, Result};
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 const APPDATA: u8 = 0x17;
 
-/// Sentinel status returned by `send_cmd` when VFS_HP_RESUME handled a
-/// re-enumeration by skipping the (undelivered) reset-triggering command and
-/// keeping the SSL Record continuous, so the caller should proceed to the next
-/// command rather than treat this as a reject. Not a real device status.
-const RESET_SKIPPED: u16 = 0xfffe;
-
 /// Load the in-session command sequence (list of plaintext hex strings).
-fn load_sequence(base: &Path) -> Result<Vec<Vec<u8>>> {
-    let path = base.join("captures/capture_seq.json");
+fn load_sequence(cfg: &Config) -> Result<Vec<Vec<u8>>> {
+    let path = cfg.capture_seq();
     let raw = std::fs::read_to_string(&path).with_context(|| {
         format!(
-            "reading {} — extract the in-session capture sequence from an HP trace (see README)",
+            "reading {} — extract the in-session capture sequence from an HP trace (see tools/)",
             path.display()
         )
     })?;
@@ -37,12 +33,6 @@ fn load_sequence(base: &Path) -> Result<Vec<Vec<u8>>> {
         .map(|h| hex::decode(h.trim()).context("bad hex in capture_seq.json"))
         .collect()
 }
-
-/// `capture_seq` indices of the two imaging commands (0x02 with a populated sign
-/// key). Each opens a ~2.5 s window in which the sensor streams image lines; a
-/// swipe must happen inside it (live-measured: the old cue, printed at idx 16,
-/// came ~4 s before the first window and made users miss it).
-const SWIPE_WINDOWS: [usize; 2] = [23, 27];
 
 /// A user cue, one short colored line: red = don't touch, green = swipe,
 /// yellow = wait. Kept to one or two words so it can be acted on at a glance.
@@ -90,6 +80,23 @@ const EP2_CHUNK: usize = 16384;
 const EP2_READ_MS: u64 = 60;
 /// Post-command EP2 drain budget. HP's imaging bursts run ~2.1 s per latch cycle.
 const EP2_BURST_MS: u64 = 2500;
+/// How long an imaging window waits for a finger. With the VFS471's own patches
+/// loaded, the GetFingerState (0x17) after an imaging command makes the sensor
+/// wait for a finger itself and stream lines only while one is on it, so this is
+/// the time the user has to swipe. `VFS_SWIPE_WAIT_MS` overrides it.
+const SWIPE_WAIT_MS: u64 = 5000;
+
+fn swipe_wait_ms() -> u64 {
+    std::env::var("VFS_SWIPE_WAIT_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(SWIPE_WAIT_MS)
+}
+
+/// Wait up to `max_ms` for the first EP2 data, appending it to `img`.
+fn wait_first_image(dev: &Sensor, img: &mut Vec<u8>, max_ms: u64) {
+    let start = Instant::now();
+    while img.is_empty() && start.elapsed() < Duration::from_millis(max_ms) {
+        img.extend_from_slice(&dev.read_image(EP2_CHUNK, EP2_READ_MS));
+    }
+}
 
 /// Drain all currently-available image bytes from EP2 into `img`.
 ///
@@ -182,36 +189,24 @@ fn mean_sd(data: &[u8]) -> (f64, f64) {
 /// then decrypt and concatenate every reply record for it. Returns the joined
 /// reply payloads (each reply's 2-byte status word stripped) and the status of
 /// the last reply, or `None` if the write ultimately failed.
-fn send_cmd(
-    dev: &mut Sensor,
-    rec: &mut Record,
-    plain: &[u8],
-    recover: Option<&crate::session::Config>,
-) -> Option<(Vec<u8>, u16)> {
-    send_cmd_draining(dev, rec, plain, recover, None)
+fn send_cmd(dev: &mut Sensor, rec: &mut Record, plain: &[u8], cfg: &Config) -> Option<(Vec<u8>, u16)> {
+    send_cmd_draining(dev, rec, plain, cfg, None)
 }
 
 /// `send_cmd` with an optional EP2 sink. When `img` is `Some`, the wait for each
 /// EP1 reply is interleaved with EP2 reads: the sensor streams image data on EP2
-/// as a side effect of the imaging-latch commands and stalls (then resets with
-/// `-108`) if that stream is left undrained while we block on EP1. HP's driver
-/// never gaps EP2; this keeps it flowing while still collecting the reply.
+/// as a side effect of the imaging commands and stalls (then resets) if that
+/// stream is left undrained while we block on EP1. HP's driver never gaps EP2;
+/// this keeps it flowing while still collecting the reply.
 fn send_cmd_draining(
     dev: &mut Sensor,
     rec: &mut Record,
     plain: &[u8],
-    recover: Option<&crate::session::Config>,
+    cfg: &Config,
     mut img: Option<&mut Vec<u8>>,
 ) -> Option<(Vec<u8>, u16)> {
-    // Experiment (VFS_HP_RESUME): snapshot the send-side Record state before this
-    // command's encrypt, so if the write hits a re-enumeration we can UNDO its seq/IV
-    // advance and continue the session exactly as HP does (HP never resends the
-    // reset-triggering command; it just sends the next poll with continuing seq).
-    let hp_resume = std::env::var("VFS_HP_RESUME").is_ok();
-    let pre_encrypt = rec.clone();
     let mut record = rec.encrypt(APPDATA, plain);
     let mut wrote = false;
-    let mut reopened = false;
     for _ in 0..4 {
         match dev.write(&record, 4000) {
             Ok(_) => {
@@ -220,42 +215,32 @@ fn send_cmd_draining(
             }
             Err(e) => {
                 let es = e.to_string();
-                if es.contains("No such device") || es.contains("NoDevice") {
-                    log::info!("sensor re-enumerated on cmd 0x{:02x}; reopening handle", plain[0]);
-                    if let Err(re) = dev.reopen() {
-                        log::warn!("reopen failed: {re}");
-                        std::thread::sleep(Duration::from_millis(100));
-                        continue;
-                    }
-                    reopened = true;
-                    if hp_resume {
-                        // HP-faithful: the undelivered command never reached the sensor,
-                        // so roll the Record back and DON'T resend it. Continue to the
-                        // next poll with an unbroken SSL sequence.
-                        *rec = pre_encrypt;
-                        log::info!(
-                            "[DEBUG-rss] HP-resume: reopened, rolled back cmd 0x{:02x} (seq continuous), \
-                             continuing WITHOUT resend/re-handshake",
-                            plain[0]
-                        );
-                        return Some((Vec::new(), RESET_SKIPPED));
-                    }
-                    // The re-enumeration drops the SSL session (post-reset reads are
-                    // zeros). HP re-establishes it via a path not captured in the
-                    // scsSend-only sequence dump, so re-run the handshake to get a
-                    // fresh session, then re-encrypt this command under it.
-                    if let Some(cfg) = recover {
-                        match crate::session::handshake(dev, cfg) {
-                            Ok(newrec) => {
-                                *rec = newrec;
-                                log::info!("re-handshaked a fresh session after reset");
-                                record = rec.encrypt(APPDATA, plain);
-                            }
-                            Err(he) => log::warn!("re-handshake failed: {he}"),
-                        }
-                    }
-                } else {
+                // A reboot shows up as NoDevice, or as a Pipe/IO/timeout error on
+                // the way out. Only a device that actually left the bus has rebooted;
+                // re-handshaking into a still-live session is how a mere stall turns
+                // into a wedged sensor. So on a device that stayed, clear the stall
+                // and resend under the same session.
+                let gone = es.contains("No such device") || es.contains("NoDevice") || dev.left_bus(2000);
+                if !gone {
+                    log::warn!("cmd 0x{:02x} write failed ({es}); sensor still present, clearing EP1 OUT and resending", plain[0]);
+                    dev.clear_halt_out();
                     std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+                log::info!("sensor rebooted on cmd 0x{:02x} ({es}); reopening and re-handshaking", plain[0]);
+                if let Err(re) = dev.reopen() {
+                    log::warn!("reopen failed: {re}");
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                // The re-enumeration drops the SSL session (post-reset reads are
+                // zeros), so re-establish a fresh session and re-encrypt this command.
+                match crate::session::open_session(dev, cfg) {
+                    Ok(newrec) => {
+                        *rec = newrec;
+                        record = rec.encrypt(APPDATA, plain);
+                    }
+                    Err(he) => log::warn!("re-handshake after reboot failed: {he}"),
                 }
             }
         }
@@ -266,53 +251,23 @@ fn send_cmd_draining(
     let mut payload = Vec::new();
     let mut last_status = 0xffffu16;
     for attempt in 0..4 {
-        let timeout = if attempt == 0 { 3000 } else { 200 };
-        match read_reply_interleaved(dev, timeout, img.as_deref_mut()) {
-            Ok(wire) => {
-            if reopened && attempt == 0 {
-                // Raw record type of the first reply: 0x17=appdata (real reply),
-                // 0x15=alert (session ALIVE but our seq/MAC desynced), all-zero
-                // header => session DEAD (device not speaking SSL on EP1).
-                let hdr: Vec<u8> = wire.iter().take(5).copied().collect();
-                let kind = match wire.first() {
-                    Some(0x17) => "appdata",
-                    Some(0x15) => "ALERT(session-alive!)",
-                    Some(0x16) => "handshake",
-                    _ if wire.iter().take(3).all(|&b| b == 0) => "ZEROS(session-dead)",
-                    _ => "other",
-                };
-                log::info!("[DEBUG-rss] first-reply raw hdr={hdr:02x?} => {kind}");
-            }
-            match rec.decrypt(&wire) {
-                Ok((_t, plain_reply)) => {
-                    let (status, _plen) = parse_reply(&plain_reply);
-                    if reopened && attempt == 0 {
-                        log::info!(
-                            "[DEBUG-rss] post-reopen first reply DECRYPTED status=0x{status:04x} \
-                             payload={}B => SESSION {}",
-                            plain_reply.len().saturating_sub(2),
-                            if status_is_ok(status) { "SURVIVED" } else { "?(status not OK)" }
-                        );
-                    }
-                    last_status = status;
-                    if plain_reply.len() > 2 {
-                        payload.extend_from_slice(&plain_reply[2..]);
-                    }
-                }
-                Err(e) => {
-                    if reopened && attempt == 0 {
-                        log::info!(
-                            "[DEBUG-rss] post-reopen first reply DECRYPT FAILED ({e}) \
-                             => SESSION DEAD (wire {} bytes: {:02x?})",
-                            wire.len(),
-                            &wire[..wire.len().min(8)]
-                        );
-                    }
-                    log::warn!("reply decrypt failed: {e}");
+        // HP's trace has exactly one reply record per command, so after the first
+        // only peek briefly for a straggler.
+        let reply = if attempt == 0 {
+            read_reply_interleaved(dev, 3000, img.as_deref_mut())
+        } else {
+            dev.read_record_split(5, 200)
+        };
+        let Ok(wire) = reply else { break };
+        match rec.decrypt(&wire) {
+            Ok((_t, plain_reply)) => {
+                let (status, _plen) = parse_reply(&plain_reply);
+                last_status = status;
+                if plain_reply.len() > 2 {
+                    payload.extend_from_slice(&plain_reply[2..]);
                 }
             }
-            }
-            Err(_) => break,
+            Err(e) => log::warn!("reply decrypt failed: {e}"),
         }
     }
     Some((payload, last_status))
@@ -357,17 +312,17 @@ fn read_reply_interleaved(
 pub fn poll_probe(
     dev: &mut Sensor,
     rec: &mut Record,
-    base: &Path,
+    cfg: &Config,
     prefix: usize,
     poll_idx: usize,
     iters: usize,
 ) -> Result<()> {
-    let seq = load_sequence(base)?;
+    let seq = load_sequence(cfg)?;
     anyhow::ensure!(poll_idx < seq.len(), "poll_idx out of range");
     log::info!("poll-probe: replaying {prefix} setup commands to reach poll-ready state");
     for plain in seq.iter().take(prefix) {
         let mut junk = Vec::new();
-        let _ = send_cmd(dev, rec, plain, None);
+        let _ = send_cmd(dev, rec, plain, cfg);
         drain_image_into(dev, &mut junk, 1);
     }
     let poll = seq[poll_idx].clone();
@@ -382,7 +337,7 @@ pub fn poll_probe(
     let mut baseline: Option<Vec<u8>> = None;
     let mut baseline_acc: Vec<Vec<u8>> = Vec::new();
     for n in 0..iters {
-        match send_cmd(dev, rec, &poll, None) {
+        match send_cmd(dev, rec, &poll, cfg) {
             Some((payload, status)) => {
                 // Build the baseline from polls 2..=5 (finger expected off).
                 if (2..=5).contains(&n) {
@@ -438,27 +393,18 @@ pub fn poll_probe(
     Ok(())
 }
 
-/// The commands of one imaging window, replayable any number of times after
-/// [`Capture::prepare`]: the poll that precedes the imaging command, the imaging
-/// command itself (`SWIPE_WINDOWS[1]`), and the two that close it. Live-checked
-/// 2026-10-04: repeating this unit keeps returning full image bursts with no
-/// recalibration.
-const WINDOW_UNIT: std::ops::RangeInclusive<usize> = 26..=29;
-/// Everything before the first window: setup, calibration (no finger!), arming.
-const PREPARE: std::ops::Range<usize> = 0..22;
-/// The recorded sequence's closing commands, sent when a request is over.
-const FINISH: std::ops::Range<usize> = 30..42;
-
 /// One in-session capture: replays the command sequence as AppData records (all
 /// in-session commands are `0x17` records on EP1 regardless of their inner
 /// command byte), decrypting every reply in order so the CBC IV chain and
 /// receive sequence stay aligned, and draining + decrypting the EP2 image
 /// stream throughout. Calibration results computed from this session's sweep
-/// frames are patched into the later commands (see `calib.rs`).
+/// frames are patched into the later commands (see `calib.rs`). Which indices are
+/// setup, imaging windows and finish comes from the [`crate::device::Device`].
 pub struct Capture<'a> {
     dev: &'a mut Sensor,
     rec: &'a mut Record,
-    cfg: &'a crate::session::Config,
+    cfg: &'a Config,
+    device: &'static crate::device::Device,
     seq: Vec<Vec<u8>>,
     // The EP2 imaging burst is AES-256-CBC encrypted; the key/IV travel in each
     // GetFingerprint command's SecurityParams TLV (see `parse_security_params`).
@@ -473,34 +419,35 @@ pub struct Capture<'a> {
 }
 
 impl<'a> Capture<'a> {
-    pub fn new(
-        dev: &'a mut Sensor,
-        rec: &'a mut Record,
-        base: &Path,
-        cfg: &'a crate::session::Config,
-    ) -> Result<Self> {
+    pub fn new(dev: &'a mut Sensor, rec: &'a mut Record, cfg: &'a Config) -> Result<Self> {
+        let device = dev.device;
         Ok(Capture {
             dev,
             rec,
             cfg,
-            seq: load_sequence(base)?,
+            device,
+            seq: load_sequence(cfg)?,
             cur_key: None,
             cur_iv: [0u8; 16],
             prompt: std::env::var("VFS_NO_PROMPT").is_err(),
         })
     }
 
-    /// Setup + calibration, up to the first imaging window (~9 s). The sensor
-    /// must not be touched while this runs.
+    /// Setup + calibration, up to the first imaging window. The sensor must not be
+    /// touched while this runs.
     pub fn prepare(&mut self) -> Result<()> {
         cue(Cue::DontTouch, self.prompt);
-        self.run(PREPARE).map(|_| ())
+        // Any imaging window inside the prepare range has its image discarded, so
+        // don't hold it open waiting for a finger.
+        let range = self.device.prepare.clone();
+        self.run(range, 0).map(|_| ())
     }
 
-    /// Open one imaging window (~3 s; the swipe cue is on while it records) and
-    /// return its decrypted line stream.
+    /// Open one imaging window (the swipe cue is on while it records) and return
+    /// its decrypted line stream.
     pub fn window(&mut self) -> Result<Vec<u8>> {
-        let out = self.run(WINDOW_UNIT);
+        let range = self.device.window_unit.clone();
+        let out = self.run(range, swipe_wait_ms());
         cue(Cue::Wait, self.prompt);
         out
     }
@@ -508,54 +455,37 @@ impl<'a> Capture<'a> {
     /// Close the capture (the recorded sequence's trailing commands).
     pub fn finish(&mut self) -> Result<()> {
         cue(Cue::DontTouch, self.prompt);
-        self.run(FINISH).map(|_| ())
+        let range = self.device.finish.clone();
+        self.run(range, 0).map(|_| ())
     }
 
     /// Send commands `idxs` of the sequence; returns the decrypted image bytes
-    /// they produced.
-    fn run(&mut self, idxs: impl IntoIterator<Item = usize>) -> Result<Vec<u8>> {
+    /// they produced. Each imaging window waits up to `wait_ms` for a finger.
+    fn run(&mut self, idxs: impl IntoIterator<Item = usize>, wait_ms: u64) -> Result<Vec<u8>> {
         let mut out = Vec::new(); // decrypted image line stream (01fe frames)
-        // Experiment: the 1-byte 0x17 entries may be a trace artifact (the SSL AppData
-        // record-type byte leaking into the command dump); each precedes a reset. Skip
-        // them to test whether they are what triggers the imaging-latch re-enumeration.
-        let skip_17 = std::env::var("VFS_SKIP_17").is_ok();
+        let swipe_windows = self.device.swipe_windows;
         for i in idxs {
             let plain = self.seq[i].clone();
-            if skip_17 && plain.as_slice() == [0x17] {
-                log::info!("[{i:3}] skipping 1-byte 0x17 (artifact test)");
-                continue;
-            }
             // The swipe cue goes on exactly when an imaging command is sent.
-            if SWIPE_WINDOWS.contains(&i) {
+            if swipe_windows.contains(&i) {
                 cue(Cue::Swipe, self.prompt);
-            } else if i.checked_sub(1).is_some_and(|p| SWIPE_WINDOWS.contains(&p)) {
-                cue(Cue::Wait, self.prompt);
             }
             let cmd_op = plain[0];
             if let Some((k, iv)) = parse_security_params(&plain) {
                 self.cur_key = Some(k);
                 self.cur_iv = iv;
-                log::info!("[{i:3}] cmd=0x{cmd_op:02x} carries SecurityParams (AES-256 image key/IV)");
+                log::debug!("[{i:3}] cmd=0x{cmd_op:02x} carries SecurityParams (AES-256 image key/IV)");
             }
-            // send_cmd handles the imaging-latch re-enumeration: reopen the handle and
+            // send_cmd handles an imaging re-enumeration: reopen the handle and
             // re-handshake a fresh session (the reset drops the old one), then resend.
-            // Experiment: VFS_NO_REHANDSHAKE reopens but does NOT re-handshake, to test
-            // whether the sensor enters an imaging mode that streams EP2 frames without
-            // a fresh session (i.e. whether the re-handshake is what causes the reset loop).
-            let recover = if std::env::var("VFS_NO_REHANDSHAKE").is_ok() { None } else { Some(self.cfg) };
             let mut img = Vec::new(); // this command's raw (encrypted) EP2 bytes
-            match send_cmd_draining(self.dev, self.rec, &plain, recover, Some(&mut img)) {
-                Some((_, RESET_SKIPPED)) => {
-                    log::info!(
-                        "[{i:3}] cmd=0x{cmd_op:02x} -> RE-ENUM, skipped (HP-resume); next cmd tests session survival"
-                    );
-                }
+            match send_cmd_draining(self.dev, self.rec, &plain, self.cfg, Some(&mut img)) {
                 Some((payload, status)) => {
                     let ok = status_is_ok(status);
-                    log::info!(
+                    log::debug!(
                         "[{i:3}] cmd=0x{cmd_op:02x} -> status=0x{status:04x} payload={}B {}",
                         payload.len(),
-                        if ok { "OK" } else { "**REJECT**" }
+                        if ok { "OK" } else { "**REJECT**" },
                     );
                 }
                 None => {
@@ -564,28 +494,52 @@ impl<'a> Capture<'a> {
                 }
             }
             // Keep draining until EP2 has been quiet for a few reads, or the burst
-            // budget elapses. HP reads ~1.7 MB (~2.1 s at wire rate) after each
-            // imaging latch before sending the next command; with no finger the sensor
-            // streams baseline frames indefinitely, so the time bound is what ends it.
-            drain_image_bounded(self.dev, &mut img, 3, EP2_BURST_MS);
+            // budget elapses. With no finger the sensor streams baseline frames
+            // indefinitely, so the time bound is what ends it. Only 0x02
+            // GetFingerprint streams image data; after anything else that left EP2
+            // silent, one quiet read is enough.
+            let quiet = if cmd_op == 0x02 || !img.is_empty() { 3 } else { 1 };
+            // On a sensor-gated model (VFS471) the imaging burst streams after the
+            // GetFingerState (0x17) that follows an imaging command, and only if a
+            // finger is on the sensor when that 0x17 is sent (reply byte 0 is 0x02
+            // with a finger, 0x00 without). A moving swipe is almost never present
+            // at that single instant, so re-poll 0x17 until a finger appears (or
+            // `wait_ms` elapses), then collect the burst it releases.
+            let burst = self.device.finger_gated
+                && cmd_op == 0x17
+                && i.checked_sub(1).is_some_and(|p| swipe_windows.contains(&p));
+            if burst {
+                let deadline = Instant::now() + Duration::from_millis(wait_ms);
+                while img.is_empty() && Instant::now() < deadline {
+                    if let Some((st, _)) = send_cmd_draining(self.dev, self.rec, &plain, self.cfg, Some(&mut img)) {
+                        if st.first() == Some(&0x02) {
+                            // Finger present: the burst is now streaming on EP2.
+                            wait_first_image(self.dev, &mut img, 1000);
+                        }
+                    }
+                }
+            }
+            drain_image_bounded(self.dev, &mut img, quiet, EP2_BURST_MS);
+            if burst {
+                cue(Cue::Wait, self.prompt);
+            }
             let slice = &img[..];
             if slice.is_empty() {
                 continue;
             }
             let (mean, sd) = mean_sd(slice);
-            log::info!("[{i:3}]   EP2 +{}B mean={mean:.1} sd={sd:.1}", slice.len());
+            log::debug!("[{i:3}]   EP2 +{}B mean={mean:.1} sd={sd:.1}", slice.len());
             // Diagnostic: dump each command's raw EP2 slice (calibration RE).
             if let Ok(dir) = std::env::var("VFS_DUMP_SLICES") {
                 let _ = std::fs::write(format!("{dir}/{i:02}_raw.bin"), slice);
             }
-            // Calibration sweep frames arrive in the clear: compute this step's
-            // result and carry it into the remaining commands (see calib.rs).
-            // VFS_NO_CALIB replays the recorded values instead (A/B diagnostic).
-            let calib = std::env::var("VFS_NO_CALIB").is_err();
-            if let Some(applied) =
-                calib.then(|| crate::calib::carry_forward(i, slice, &mut self.seq[i + 1..])).flatten()
-            {
-                log::info!("[{i:3}]   calibration: {applied}");
+            // Calibration sweep frames arrive in the clear: on a model that computes
+            // calibration, compute this step's result and carry it into the later
+            // commands (see calib.rs). Models that replay it keep the recorded values.
+            if self.device.calib() == Calib::Compute {
+                if let Some(applied) = crate::calib::carry_forward(i, slice, &mut self.seq[i + 1..]) {
+                    log::debug!("[{i:3}]   calibration: {applied}");
+                }
             }
             // Decrypt this command's EP2 slice under the active image key, chaining
             // the CBC IV forward for the next slice (matches HP's per-read decrypt).
@@ -604,16 +558,11 @@ impl<'a> Capture<'a> {
 /// One whole recorded capture: calibration, the two imaging windows, closing
 /// commands. Returns the decrypted image line stream of both windows. A finger
 /// must be swiping during a window for real frames to appear.
-pub fn arm_capture(
-    dev: &mut Sensor,
-    rec: &mut Record,
-    base: &Path,
-    cfg: &crate::session::Config,
-) -> Result<Vec<u8>> {
-    let mut cap = Capture::new(dev, rec, base, cfg)?;
+pub fn arm_capture(dev: &mut Sensor, rec: &mut Record, cfg: &Config) -> Result<Vec<u8>> {
+    let mut cap = Capture::new(dev, rec, cfg)?;
     cue(Cue::DontTouch, cap.prompt);
     let n = cap.seq.len();
-    let out = cap.run(0..n)?;
+    let out = cap.run(0..n, swipe_wait_ms())?;
     cue(Cue::DontTouch, cap.prompt);
     log::info!("capture replayed ({n} commands, {} decrypted image bytes)", out.len());
     Ok(out)

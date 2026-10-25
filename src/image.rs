@@ -18,7 +18,7 @@
 //!     to `max_bits`), read little-endian from the packed stream, left-justified
 //!     to 8 bits (`<< (8 - w)`), then scattered via `perm[i]`.
 //!
-//! The permutation table is our `captures/perm_264.bin` (HP keeps it at
+//! The permutation table is `data/<model>/perm.bin` (HP keeps it at
 //! `cfg+0x57c`). The per-column `bits` table (HP: `cfg+8`) is capture-specific;
 //! dump it once with `scripts/dump_dli_config.gdb.py` for the raw-EP2 path.
 
@@ -41,19 +41,19 @@ pub struct DliConfig {
 }
 
 impl DliConfig {
-    /// Main-image config: perm from `captures/perm_264.bin`, width 264.
+    /// Main-image config: perm from `data/<model>/perm.bin`.
     /// `mode`/`bits` default to a plain 8-bit scatter and may be overridden by
-    /// `captures/dli_config.json` when present (see `dump_dli_config.gdb.py`).
-    pub fn load_main(base: &Path) -> Result<Self> {
-        let perm = load_perm(&base.join("captures/perm_264.bin"))?;
+    /// `data/<model>/dli_config.json` when present (see `dump_dli_config.gdb.py`).
+    pub fn load_main(data_dir: &Path) -> Result<Self> {
+        let perm = load_perm(&data_dir.join("perm.bin"))?;
         let width = perm.len();
-        let cfg_path = base.join("captures/dli_config.json");
+        let cfg_path = data_dir.join("dli_config.json");
         if cfg_path.exists() {
             let raw = std::fs::read_to_string(&cfg_path)?;
             let j: serde_json::Value = serde_json::from_str(&raw)?;
             let mode = j["mode"].as_u64().unwrap_or(8) as u32;
             let max_bits = j["max_bits"].as_u64().unwrap_or(8) as u32;
-            // a dumped config carries its own perm + width; fall back to perm_264.bin
+            // a dumped config carries its own perm + width; fall back to perm.bin
             let perm = j["perm"]
                 .as_array()
                 .map(|a| a.iter().map(|v| v.as_i64().unwrap_or(0) as i16).collect())

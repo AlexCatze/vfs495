@@ -9,7 +9,7 @@
 //! are performed here. No command is synthesised or fuzzed.
 
 use anyhow::{anyhow, Context, Result};
-use rusb::{Device, DeviceHandle, GlobalContext};
+use rusb::{Device as UsbDevice, DeviceHandle, GlobalContext};
 use std::io::Write;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -31,22 +31,44 @@ fn wire_log(tag: &str, ep: u8, data: &[u8]) {
     }
 }
 
+use crate::device::Device;
+
 pub const VID: u16 = 0x138a;
-pub const PID: u16 = 0x003f;
 pub const EP_OUT: u8 = 0x01;
 pub const EP_IN: u8 = 0x81;
 pub const EP_IMG: u8 = 0x82;
+
+/// The profile of the first supported sensor on the bus, if any.
+pub fn detect() -> Option<&'static Device> {
+    for dev in rusb::devices().ok()?.iter() {
+        if let Ok(desc) = dev.device_descriptor() {
+            if desc.vendor_id() == VID {
+                if let Some(d) = Device::by_pid(desc.product_id()) {
+                    return Some(d);
+                }
+            }
+        }
+    }
+    None
+}
 
 /// An open, claimed handle to the sensor.
 pub struct Sensor {
     handle: DeviceHandle<GlobalContext>,
     reattach: bool,
+    /// The profile of the sensor this handle is on.
+    pub device: &'static Device,
+    /// (bus, address) of the device this handle is on. A re-enumeration always
+    /// gives the sensor a new address, so this tells a real reboot apart from a
+    /// transfer error on a device that is still there.
+    location: (u8, u8),
 }
 
 impl Sensor {
-    /// Find, open and claim interface 0 of the first VFS495 on the bus.
-    pub fn open() -> Result<Self> {
-        let dev = find_device().context("VFS495 (138a:003f) not found on USB")?;
+    /// Find, open and claim interface 0 of the given sensor model on the bus.
+    pub fn open(device: &'static Device) -> Result<Self> {
+        let dev = find_device(device.pid)
+            .with_context(|| format!("{} (138a:{:04x}) not found on USB", device.model, device.pid))?;
         let handle = dev.open().context("failed to open device (permissions? try sudo / udev rule)")?;
 
         let mut reattach = false;
@@ -58,7 +80,43 @@ impl Sensor {
         }
         handle.set_active_configuration(1).ok();
         handle.claim_interface(0).context("failed to claim interface 0")?;
-        Ok(Sensor { handle, reattach })
+        Ok(Sensor { handle, reattach, device, location: (dev.bus_number(), dev.address()) })
+    }
+
+    /// Whether the device behind this handle has left the bus (rebooted),
+    /// waiting up to `wait_ms` for it to go: right after a failed transfer the
+    /// pre-reboot device is often still enumerated for a moment.
+    pub fn left_bus(&self, wait_ms: u64) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_millis(wait_ms);
+        loop {
+            if !device_at(self.location) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// USB port reset (HP's `palSensorHWReset` does exactly this), then
+    /// re-acquire the device: the sensor comes back as if freshly plugged in.
+    pub fn usb_reset(&mut self) -> Result<()> {
+        // On success the handle stays valid (libusb restores the claimed
+        // interface); if the device re-enumerated instead, re-acquire it.
+        match self.handle.reset() {
+            Ok(()) => {
+                std::thread::sleep(Duration::from_millis(300));
+                Ok(())
+            }
+            Err(_) => self.reopen(),
+        }
+    }
+
+    /// Clear a stall on EP1 OUT after a failed write on a device that did not
+    /// reboot.
+    pub fn clear_halt_out(&self) {
+        let _ = self.handle.clear_halt(EP_OUT);
     }
 
     /// Write a command to EP1 OUT.
@@ -177,30 +235,34 @@ impl Sensor {
     pub fn reopen(&mut self) -> Result<()> {
         // drop the stale handle first
         let _ = self.handle.release_interface(0);
+        // Wait for the OLD device to drop off the bus before grabbing a handle:
+        // right after a Pipe error the pre-reboot device is often still enumerated,
+        // and opening it leads to a doomed handshake + a wasted second reopen. A
+        // confirmed disconnect (keyed on the old bus address) makes the next find
+        // return the FRESH device; a sensor already back under its new address is
+        // not waited on.
+        self.left_bus(2000);
         for _ in 0..30 {
             std::thread::sleep(Duration::from_millis(100));
-            if let Some(dev) = find_device() {
+            if let Some(dev) = find_device(self.device.pid) {
                 if let Ok(handle) = dev.open() {
                     self.reattach = false;
                     if handle.kernel_driver_active(0).unwrap_or(false) {
                         let _ = handle.detach_kernel_driver(0);
                         self.reattach = true;
                     }
-                    // set_active_configuration(1) re-issues SET_CONFIGURATION even
-                    // when config 1 is already active; libusb treats that as a
-                    // lightweight device reset (endpoints/toggles, and likely the
-                    // firmware SSL session). HP never re-issues it across the 0x04
-                    // re-enumeration, so by default we skip it and only re-claim the
-                    // interface. VFS_REOPEN_SETCONFIG=1 restores the old behavior for
-                    // differential testing (isolating this as the session killer).
-                    if std::env::var("VFS_REOPEN_SETCONFIG").is_ok() {
-                        log::info!("[DEBUG-rss] reopen: issuing set_active_configuration(1)");
-                        handle.set_active_configuration(1).ok();
-                    } else {
-                        log::info!("[DEBUG-rss] reopen: skipping set_active_configuration(1)");
-                    }
+                    // NB: do NOT re-issue set_active_configuration(1) here. libusb
+                    // treats a repeated SET_CONFIGURATION as a lightweight device
+                    // reset (endpoints/toggles, and the firmware SSL session); HP
+                    // never does it across the imaging re-enumeration, so neither do
+                    // we — just re-claim the interface.
                     if handle.claim_interface(0).is_ok() {
                         self.handle = handle;
+                        self.location = (dev.bus_number(), dev.address());
+                        // The device re-enumerates (findable on USB) well before its
+                        // firmware is ready to resume the SSL session; resuming too
+                        // early reads 5-byte zeros, so wait for it to settle.
+                        std::thread::sleep(Duration::from_millis(self.device.settle_ms()));
                         return Ok(());
                     }
                 }
@@ -219,10 +281,22 @@ impl Drop for Sensor {
     }
 }
 
-fn find_device() -> Option<Device<GlobalContext>> {
+/// Whether this sensor is still enumerated at `(bus, address)`.
+fn device_at((bus, addr): (u8, u8)) -> bool {
+    rusb::devices()
+        .ok()
+        .map(|list| {
+            list.iter()
+                .any(|d| d.bus_number() == bus && d.address() == addr)
+        })
+        .unwrap_or(false)
+}
+
+/// The first `138a:<pid>` device on the bus.
+fn find_device(pid: u16) -> Option<UsbDevice<GlobalContext>> {
     rusb::devices().ok()?.iter().find(|d| {
         d.device_descriptor()
-            .map(|desc| desc.vendor_id() == VID && desc.product_id() == PID)
+            .map(|desc| desc.vendor_id() == VID && desc.product_id() == pid)
             .unwrap_or(false)
     })
 }

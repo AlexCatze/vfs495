@@ -305,3 +305,33 @@ mod tests {
         assert_eq!(decrypt_image_stream(&key, &iv, &ct_short), plain);
     }
 }
+// ---- append to src/crypto.rs (after rsa_encrypt) ----
+
+/// Raw PKCS#1 v1.5 **type 1** RSA signature (private-key op).
+/// Modulus and d are big-endian here (unlike the LE public modulus quirk):
+/// the CertificateVerify is a standard RSA private-key operation.
+/// EM = 00 01 FF..FF 00 || digest   (no ASN.1 DigestInfo — SSLv3 signs the raw
+/// 36-byte MD5+SHA1 concatenation directly).
+pub fn rsa_sign(modulus_be: &[u8], d_be: &[u8], digest: &[u8]) -> Vec<u8> {
+    let n = BigUint::from_bytes_be(modulus_be);
+    let d = BigUint::from_bytes_be(d_be);
+    let k = modulus_be.len();
+
+    let mut em = Vec::with_capacity(k);
+    em.push(0x00);
+    em.push(0x01);
+    let ps_len = k - 3 - digest.len();
+    em.extend(std::iter::repeat(0xffu8).take(ps_len));
+    em.push(0x00);
+    em.extend_from_slice(digest);
+
+    let m = BigUint::from_bytes_be(&em);
+    let c = m.modpow(&d, &n);
+    let mut wire = c.to_bytes_be();
+    if wire.len() < k {
+        let mut padded = vec![0u8; k - wire.len()];
+        padded.extend_from_slice(&wire);
+        wire = padded;
+    }
+    wire
+}

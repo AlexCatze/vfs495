@@ -1,9 +1,11 @@
-//! Open-source userspace driver for the Validity **VFS495** swipe fingerprint
-//! sensor (USB `138a:003f`), as found in the HP EliteBook 820 G3.
+//! Open-source userspace driver for the Validity "Falcon" family of swipe
+//! fingerprint sensors: the **VFS495** (`138a:003f`) and the **VFS471**
+//! (`138a:003c`). The per-sensor differences live in [`device`]; the rest of the
+//! driver is model-agnostic.
 //!
-//! Pipeline: [`usb`] transport → [`session`] (open SSLv3 handshake, no pairing on
-//! an unowned sensor) → [`capture`] (EP2 image stream) → [`image`] (DLI decode) →
-//! [`virtimage`] (feed libfprint's `virtual_image` for fprintd/PAM/GDM).
+//! Pipeline: [`usb`] transport → [`session`] (open SSLv3 handshake) → [`capture`]
+//! (EP2 image stream) → [`image`] (DLI decode) → [`swipe`] (reconstruction) →
+//! [`virtimage`] (feed libfprint's `virtual_image` for fprintd/PAM/login).
 //!
 //! The [`crypto`] module is validated byte-exact against a live trace; run
 //! [`selftest`] to check it offline with no hardware.
@@ -11,6 +13,7 @@
 pub mod calib;
 pub mod capture;
 pub mod crypto;
+pub mod device;
 pub mod image;
 pub mod session;
 pub mod swipe;

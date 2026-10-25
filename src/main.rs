@@ -1,19 +1,35 @@
-//! `vfs495` — command-line driver for the Validity VFS495 fingerprint sensor.
+//! `vfs495` — command-line driver for the Validity "Falcon" family (VFS495,
+//! VFS471) of fingerprint sensors.
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use vfs495::device::{Device, Lateral};
 use vfs495::{capture, crypto, image, session, swipe, usb, virtimage};
 
 #[derive(Parser)]
-#[command(name = "vfs495", version, about = "Open userspace driver for the Validity VFS495 (138a:003f)")]
+#[command(name = "vfs495", version, about = "Open userspace driver for the Validity Falcon family (VFS495/VFS471)")]
 struct Cli {
-    /// Base directory holding captures/ and vendor/ (defaults to the current dir).
+    /// Base directory holding data/ (defaults to the current dir).
     #[arg(long, global = true, default_value = ".")]
     base: PathBuf,
 
+    /// Sensor model (vfs471, vfs495). Auto-detected from USB when omitted.
+    #[arg(long, global = true)]
+    device: Option<String>,
+
     #[command(subcommand)]
     cmd: Command,
+}
+
+/// Resolve the sensor profile: `--device` if given, else the one on the USB bus.
+fn resolve_device(cli: &Cli) -> Result<&'static Device> {
+    match &cli.device {
+        Some(name) => Device::by_name(name)
+            .ok_or_else(|| anyhow::anyhow!("unknown --device '{name}' (expected vfs471 or vfs495)")),
+        None => usb::detect()
+            .ok_or_else(|| anyhow::anyhow!("no supported sensor on USB; pass --device vfs471|vfs495")),
+    }
 }
 
 #[derive(Subcommand)]
@@ -113,6 +129,10 @@ enum Command {
     WindowTest {
         #[arg(long, default_value_t = 6)]
         count: usize,
+        /// Save each window's decrypted EP2 stream to `<dir>/winNN.stream` (feed
+        /// to `decode` offline for raw vs. reconstructed images).
+        #[arg(long)]
+        dump: Option<std::path::PathBuf>,
     },
     Daemon {
         /// Socket path (defaults to $FP_VIRTUAL_IMAGE).
@@ -140,39 +160,50 @@ enum Command {
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
-    let cfg = session::Config::from_base(&cli.base);
+
+    // Selftest is pure crypto and needs no sensor; everything else needs a model.
+    if matches!(cli.cmd, Command::Selftest) {
+        let ok = vfs495::selftest(&cli.base)?;
+        println!("\n=== SELFTEST: {} ===", if ok { "PASS" } else { "FAIL" });
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+    let device = resolve_device(&cli)?;
+    let cfg = session::Config::for_device(&cli.base, device);
 
     match cli.cmd {
-        Command::Selftest => {
-            let ok = vfs495::selftest(&cli.base)?;
-            println!("\n=== SELFTEST: {} ===", if ok { "PASS" } else { "FAIL" });
-            std::process::exit(if ok { 0 } else { 1 });
-        }
+        Command::Selftest => unreachable!("handled above"),
         Command::Handshake => {
-            let dev = usb::Sensor::open()?;
-            let _rec = session::handshake(&dev, &cfg)?;
-            println!("[+] handshake OK — secure session established");
+            let mut dev = usb::Sensor::open(device)?;
+            let mut rec = session::open_session(&mut dev, &cfg)?;
+            session::close(&dev, &mut rec);
+            println!("[+] handshake OK — secure session established (and closed)");
         }
         Command::Capture { out } => {
-            let mut dev = usb::Sensor::open()?;
-            let mut rec = session::handshake(&dev, &cfg)?;
-            let stream = capture::arm_capture(&mut dev, &mut rec, &cli.base, &cfg)?;
+            let mut dev = usb::Sensor::open(device)?;
+            let mut rec = session::open_session(&mut dev, &cfg)?;
+            let stream = capture::arm_capture(&mut dev, &mut rec, &cfg);
+            session::close(&dev, &mut rec);
+            let stream = stream?;
             std::fs::write(&out, &stream)?;
             println!("[+] wrote {} decrypted image bytes to {}", stream.len(), out.display());
         }
         Command::PollProbe { prefix, poll_idx, iters } => {
-            let mut dev = usb::Sensor::open()?;
-            let mut rec = session::handshake(&dev, &cfg)?;
-            capture::poll_probe(&mut dev, &mut rec, &cli.base, prefix, poll_idx, iters)?;
+            let mut dev = usb::Sensor::open(device)?;
+            let mut rec = session::open_session(&mut dev, &cfg)?;
+            let probed = capture::poll_probe(&mut dev, &mut rec, &cfg, prefix, poll_idx, iters);
+            session::close(&dev, &mut rec);
+            probed?;
             println!("[+] poll-probe done");
         }
         Command::RidgeProbe { min_contact, out } => {
-            let mut dev = usb::Sensor::open()?;
-            let mut rec = session::handshake(&dev, &cfg)?;
+            let mut dev = usb::Sensor::open(device)?;
+            let mut rec = session::open_session(&mut dev, &cfg)?;
             // Fire the full imaging sequence (same path the daemon arms on a
             // detected finger) and decode it, exactly as the daemon's gate does.
-            let stream = capture::arm_capture(&mut dev, &mut rec, &cli.base, &cfg)?;
-            let dli = image::DliConfig::load_main(&cli.base)?;
+            let stream = capture::arm_capture(&mut dev, &mut rec, &cfg);
+            session::close(&dev, &mut rec);
+            let stream = stream?;
+            let dli = image::DliConfig::load_main(&cfg.data_dir)?;
             let lines = image::decode_ep2(&stream, 272, &dli);
             println!(
                 "[i] decrypted {} EP2 bytes -> {} decoded lines x {} cols",
@@ -184,7 +215,7 @@ fn main() -> Result<()> {
                 bail!("no lines decoded — capture produced no frames");
             }
             let (gate, contact) = finger_gate(&lines, min_contact);
-            let swipe = swipe::reconstruct_swipe(&lines);
+            let swipe = swipe::reconstruct_swipe(&lines, device.lateral());
             let verdict = gate && swipe.is_some();
             let (px, w, h) = swipe.unwrap_or_else(|| image::reconstruct(&lines, true));
             let ridge = image::ridge_peak(&px, w, h);
@@ -201,7 +232,7 @@ fn main() -> Result<()> {
         }
         Command::Decode { input, out, stride, no_crop, feed } => {
             let raw = std::fs::read(&input)?;
-            let cfg = image::DliConfig::load_main(&cli.base)?;
+            let cfg = image::DliConfig::load_main(&cfg.data_dir)?;
             let lines = image::decode_ep2(&raw, stride, &cfg);
             println!("[i] unpacked {} lines x {} cols", lines.rows, lines.cols);
             if lines.rows < 20 {
@@ -215,7 +246,7 @@ fn main() -> Result<()> {
                     lines.contact_rows(25.0)
                 );
             }
-            let (px, w, h) = match (no_crop, swipe::reconstruct_swipe(&lines)) {
+            let (px, w, h) = match (no_crop, swipe::reconstruct_swipe(&lines, device.lateral())) {
                 (false, Some(img)) => img,
                 (false, None) => {
                     println!("[!] no usable swipe (finger moving across the sensor); writing the raw band");
@@ -246,17 +277,19 @@ fn main() -> Result<()> {
         }
         Command::Run { socket } => {
             let sock = resolve_socket(socket)?;
-            let mut dev = usb::Sensor::open()?;
-            let mut rec = session::handshake(&dev, &cfg)?;
-            let stream = capture::arm_capture(&mut dev, &mut rec, &cli.base, &cfg)?;
-            let cfg = image::DliConfig::load_main(&cli.base)?;
+            let mut dev = usb::Sensor::open(device)?;
+            let mut rec = session::open_session(&mut dev, &cfg)?;
+            let stream = capture::arm_capture(&mut dev, &mut rec, &cfg);
+            session::close(&dev, &mut rec);
+            let stream = stream?;
+            let cfg = image::DliConfig::load_main(&cfg.data_dir)?;
             let lines = image::decode_ep2(&stream, 272, &cfg);
             // Never feed a blank capture (a missed swipe) into an enrollment.
             let (accept, contact) = finger_gate(&lines, DEFAULT_MIN_CONTACT);
             if !accept {
                 bail!("no finger detected ({contact} contact rows < {DEFAULT_MIN_CONTACT}) — nothing fed");
             }
-            let Some((px, w, h)) = swipe::reconstruct_swipe(&lines) else {
+            let Some((px, w, h)) = swipe::reconstruct_swipe(&lines, device.lateral()) else {
                 bail!("finger touched but did not swipe ({contact} contact rows, no motion) — nothing fed");
             };
             let (fpx, fw, fh) = image::window_for_feed(&px, w, h);
@@ -269,35 +302,46 @@ fn main() -> Result<()> {
             virtimage::send_image(&sock, &fpx, fw as u32, fh as u32)?;
             println!("[+] captured a {w}x{h} swipe ({contact} contact rows) and fed {fw}x{fh} to virtual_image");
         }
-        Command::WindowTest { count } => {
-            let mut dev = usb::Sensor::open()?;
-            let mut rec = session::handshake(&dev, &cfg)?;
-            let dli = image::DliConfig::load_main(&cli.base)?;
-            let mut cap = capture::Capture::new(&mut dev, &mut rec, &cli.base, &cfg)?;
-            let t0 = std::time::Instant::now();
-            cap.prepare()?;
-            println!("[i] prepared in {:.1}s", t0.elapsed().as_secs_f32());
-            for n in 0..count {
-                let t = std::time::Instant::now();
-                let stream = cap.window()?;
-                let lines = image::decode_ep2(&stream, 272, &dli);
-                let swipe = swipe::reconstruct_swipe(&lines).map(|(_, w, h)| format!("{w}x{h}"));
-                println!(
-                    "[i] window {n}: {:.1}s, {} bytes, {} lines, {} contact rows, median line sd {:.1}, swipe {:?}",
-                    t.elapsed().as_secs_f32(),
-                    stream.len(),
-                    lines.rows,
-                    lines.contact_rows(image::CONTACT_SD),
-                    lines.median_line_std(),
-                    swipe
-                );
+        Command::WindowTest { count, dump } => {
+            if let Some(d) = &dump {
+                std::fs::create_dir_all(d)?;
             }
-            cap.finish()?;
-            println!("[+] finished after {:.1}s", t0.elapsed().as_secs_f32());
+            let mut dev = usb::Sensor::open(device)?;
+            let mut rec = session::open_session(&mut dev, &cfg)?;
+            let dli = image::DliConfig::load_main(&cfg.data_dir)?;
+            let tested = (|| -> Result<()> {
+                let mut cap = capture::Capture::new(&mut dev, &mut rec, &cfg)?;
+                let t0 = std::time::Instant::now();
+                cap.prepare()?;
+                println!("[i] prepared in {:.1}s", t0.elapsed().as_secs_f32());
+                for n in 0..count {
+                    let t = std::time::Instant::now();
+                    let stream = cap.window()?;
+                    if let Some(d) = &dump {
+                        std::fs::write(d.join(format!("win{n:02}.stream")), &stream)?;
+                    }
+                    let lines = image::decode_ep2(&stream, 272, &dli);
+                    let swipe = swipe::reconstruct_swipe(&lines, device.lateral()).map(|(_, w, h)| format!("{w}x{h}"));
+                    println!(
+                        "[i] window {n}: {:.1}s, {} bytes, {} lines, {} contact rows, median line sd {:.1}, swipe {:?}",
+                        t.elapsed().as_secs_f32(),
+                        stream.len(),
+                        lines.rows,
+                        lines.contact_rows(image::CONTACT_SD),
+                        lines.median_line_std(),
+                        swipe
+                    );
+                }
+                cap.finish()?;
+                println!("[+] finished after {:.1}s", t0.elapsed().as_secs_f32());
+                Ok(())
+            })();
+            session::close(&dev, &mut rec);
+            tested?;
         }
         Command::Daemon { socket, min_contact, once, gap, fprintd } => {
             let sock = resolve_socket(socket)?;
-            run_daemon(&cli.base, &cfg, &sock, min_contact, once, gap, fprintd)?;
+            run_daemon(device, &cfg, &sock, min_contact, once, gap, fprintd)?;
         }
     }
     Ok(())
@@ -319,14 +363,14 @@ fn finger_gate(lines: &image::Lines, min_contact: usize) -> (bool, usize) {
 /// column pattern removed, a blank sensor is quiet (row sd ~4) and a swiped
 /// finger's rows are ~25-60. (The old ridge_peak gate measured noise statistics,
 /// not ridges — NOTES 2026-10-01.)
-fn swipe_from_window(stream: &[u8], dli: &image::DliConfig, min_contact: usize) -> Option<(Vec<u8>, u32, u32)> {
+fn swipe_from_window(stream: &[u8], dli: &image::DliConfig, min_contact: usize, lateral: Lateral) -> Option<(Vec<u8>, u32, u32)> {
     let lines = image::decode_ep2(stream, 272, dli);
     let (accept, contact) = finger_gate(&lines, min_contact);
     if !accept {
         log::debug!("no finger in this window ({contact} contact rows < {min_contact})");
         return None;
     }
-    let Some((px, w, h)) = swipe::reconstruct_swipe(&lines) else {
+    let Some((px, w, h)) = swipe::reconstruct_swipe(&lines, lateral) else {
         log::info!("finger touched but did not swipe ({contact} contact rows, no motion)");
         return None;
     };
@@ -341,10 +385,11 @@ fn swipe_from_window(stream: &[u8], dli: &image::DliConfig, min_contact: usize) 
 fn reestablish(dev: &mut usb::Sensor, cfg: &session::Config) -> Result<crypto::Record> {
     if dev.reopen().is_err() {
         // The handle could not be recovered in place (e.g. the device fully went
-        // away); open the current device from scratch.
-        *dev = usb::Sensor::open()?;
+        // away); open the same model from scratch.
+        let device = dev.device;
+        *dev = usb::Sensor::open(device)?;
     }
-    session::handshake(dev, cfg)
+    session::open_session(dev, cfg)
 }
 
 /// Imaging windows opened for one request before recalibrating (~4 s each).
@@ -356,23 +401,24 @@ const NEXT_SCAN_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 /// Serve one fingerprint request: calibrate once, then open imaging windows back
 /// to back, feeding each swipe as soon as its window closes, until nothing is
 /// waiting for a finger any more. Returns the number of swipes fed.
+#[allow(clippy::too_many_arguments)]
 fn serve_request(
     cap: &mut capture::Capture,
     mut listener: std::os::unix::net::UnixStream,
     sock: &str,
     dli: &image::DliConfig,
     min_contact: usize,
+    lateral: Lateral,
     fprintd: bool,
     once: bool,
 ) -> Result<usize> {
-    cap.prepare()?;
     let mut fed = 0;
     for _ in 0..MAX_WINDOWS_PER_REQUEST {
         if !virtimage::still_wanted(&listener, fprintd) {
             break;
         }
         let stream = cap.window()?;
-        let Some((px, w, h)) = swipe_from_window(&stream, dli, min_contact) else { continue };
+        let Some((px, w, h)) = swipe_from_window(&stream, dli, min_contact, lateral) else { continue };
         match virtimage::send_on(&mut listener, &px, w, h) {
             Ok(()) => fed += 1,
             Err(e) => log::warn!("captured {w}x{h} but the request was gone: {e}"),
@@ -386,7 +432,6 @@ fn serve_request(
             None => break,
         }
     }
-    cap.finish()?;
     Ok(fed)
 }
 
@@ -396,7 +441,7 @@ fn serve_request(
 /// was re-enumerating the sensor). A capture error rebuilds the session and
 /// continues, so the daemon survives a re-enumeration or an fprintd restart.
 fn run_daemon(
-    base: &std::path::Path,
+    device: &'static Device,
     cfg: &session::Config,
     sock: &str,
     min_contact: usize,
@@ -406,26 +451,81 @@ fn run_daemon(
 ) -> Result<()> {
     // No terminal cues; the swipe cue is the LED (VFS_CUE_LED).
     std::env::set_var("VFS_NO_PROMPT", "1");
-    let dli = image::DliConfig::load_main(base)?;
+    let dli = image::DliConfig::load_main(&cfg.data_dir)?;
+    let lateral = device.lateral();
     log::info!("vfs495 feeder daemon: socket {sock}, min_contact {min_contact}");
     log::info!("idle until a fingerprint is requested (enroll/verify), then capturing");
 
-    let mut dev = usb::Sensor::open()?;
-    let mut rec = session::handshake(&dev, cfg)?;
-    loop {
-        // Capture only while something is waiting for a fingerprint: the sensor
-        // stays idle otherwise, and no stale image is ever queued.
-        let Some(listener) = virtimage::wait_for_request(sock, fprintd, None) else { continue };
-        log::info!("fingerprint requested; calibrating, then recording swipes");
-        let served = capture::Capture::new(&mut dev, &mut rec, base, cfg)
-            .and_then(|mut cap| serve_request(&mut cap, listener, sock, &dli, min_contact, fprintd, once));
-        match served {
-            Ok(fed) => log::info!("request served: {fed} swipe(s) fed"),
+    // Catch stop/termination to close the SSL session cleanly before exit: a kill
+    // otherwise leaves the session half-open and wedges the sensor (2604).
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, shutdown.clone());
+    let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, shutdown.clone());
+
+    let mut dev = loop {
+        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+        match usb::Sensor::open(device) {
+            Ok(d) => break d,
             Err(e) => {
-                // The session/device faulted (e.g. the sensor dropped off the bus).
-                // Rebuild it rather than tight-looping: back off (also lets a USB
-                // re-enumeration settle), then re-open + re-handshake. On persistent
-                // failure keep retrying at a readable rate instead of spinning.
+                log::warn!("sensor not available: {e}; retrying in 10s");
+                std::thread::sleep(std::time::Duration::from_secs(10));
+            }
+        }
+    };
+    // Retry the startup handshake instead of exiting: at boot the sensor may not be
+    // ready, and after a prior session it can briefly return 2604/Pipe until it
+    // settles. Stay up and retry gently rather than crash-looping through systemd.
+    let mut rec = loop {
+        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+        match session::open_session(&mut dev, cfg) {
+            Ok(r) => break r,
+            Err(e) => {
+                log::warn!("startup handshake failed: {e}; retrying in 30s");
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                let _ = dev.reopen();
+            }
+        }
+    };
+    loop {
+        let result: Result<()> = (|| -> Result<()> {
+            let mut cap = capture::Capture::new(&mut dev, &mut rec, cfg)?;
+            cap.prepare()?;
+            log::info!("prepared; warm session ready, waiting for fingerprint requests");
+            loop {
+                if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Ok(());
+                }
+                let Some(listener) = virtimage::wait_for_request(
+                    sock,
+                    fprintd,
+                    Some(std::time::Duration::from_secs(1)),
+                ) else {
+                    continue;
+                };
+                log::info!("fingerprint requested; recording swipe");
+                let fed =
+                    serve_request(&mut cap, listener, sock, &dli, min_contact, lateral, fprintd, once)?;
+                log::info!("request served: {fed} swipe(s) fed");
+                if once {
+                    return Ok(());
+                }
+                if gap > 0 {
+                    std::thread::sleep(std::time::Duration::from_secs(gap));
+                }
+            }
+        })();
+        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            log::info!("shutdown: sending close_notify to end the session cleanly");
+            session::close(&dev, &mut rec);
+            return Ok(());
+        }
+        match result {
+            Ok(()) => break,
+            Err(e) => {
                 log::warn!("capture failed: {e}; rebuilding session");
                 std::thread::sleep(std::time::Duration::from_secs(gap.max(3)));
                 match reestablish(&mut dev, cfg) {
@@ -435,14 +535,7 @@ fn run_daemon(
                     }
                     Err(e2) => log::warn!("session rebuild failed: {e2}; will retry"),
                 }
-                continue;
             }
-        }
-        if once {
-            break;
-        }
-        if gap > 0 {
-            std::thread::sleep(std::time::Duration::from_secs(gap));
         }
     }
     Ok(())

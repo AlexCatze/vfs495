@@ -22,6 +22,7 @@
 //! tables; here the lag is tracked at sub-line precision and rows are
 //! interpolated. See NOTES.md 2026-10-03 for the reverse engineering.
 
+use crate::device::Lateral;
 use crate::image::{box_blur, Lines, CONTACT_SD};
 
 /// Primary (imaging) pixels per line.
@@ -311,7 +312,7 @@ fn mask_background(px: &mut [u8], w: usize, h: usize) {
 /// Reconstruct one contact run `[a, b)` into rows of `PRI_W` background-removed
 /// pixels, one row per 50 µm of skin. `bg_pri` / `bg_sec`: whole-capture
 /// per-column medians (the sensor's fixed pattern).
-fn reconstruct_run(lines: &Lines, a: usize, b: usize, bg_pri: &[f32], bg_sec: &[f32]) -> Option<Vec<Vec<f32>>> {
+fn reconstruct_run(lines: &Lines, a: usize, b: usize, bg_pri: &[f32], bg_sec: &[f32], lateral: Lateral) -> Option<Vec<Vec<f32>>> {
     let keep = cull(lines, a, b);
     let m = keep.len();
     if m < MIN_CULLED {
@@ -383,10 +384,6 @@ fn reconstruct_run(lines: &Lines, a: usize, b: usize, bg_pri: &[f32], bg_sec: &[
             good_lag.push(lf);
         }
     }
-    if std::env::var("VFS_SWIPE_DEBUG").is_ok() {
-        let lags: Vec<usize> = path.iter().step_by((m / 40).max(1)).map(|i| i + LAG_MIN).collect();
-        eprintln!("[swipe] run {a}..{b}: kept {m}, forward {forward}, good {}, lags {lags:?}", good_idx.len());
-    }
     if good_idx.len() < MIN_GOOD {
         return None;
     }
@@ -422,6 +419,33 @@ fn reconstruct_run(lines: &Lines, a: usize, b: usize, bg_pri: &[f32], bg_sec: &[
         .collect();
     let dx = mean_filter(&median_filter(&interp_at_indices(m, &good_idx, &good_dx), DX_MEDIAN), DX_MEAN);
 
+    // Lateral-drift handling (`lateral`, from the device profile). Integrating
+    // `dx/l` row-by-row turns any constant bias in the drift estimate into a
+    // linearly growing sideways shift — a shear/rotation of the whole print
+    // (confirmed on the VFS471 2026-10-25: the raw decode is laterally straight,
+    // `Full` sheared it ~30°, and `None` restores upright, full-width prints that
+    // match far better). `Detrend` removes only the DC bias (keeps genuine drift
+    // variation); `Full` accumulates everything (the original VFS495 behavior).
+    let drift_rate: Vec<f32> = (0..m)
+        .map(|t| {
+            let l = lag[t].max(1.0);
+            dx[t] / l
+        })
+        .collect();
+    let mean_rate = {
+        let mut moving_rates = Vec::new();
+        let mut g = 0;
+        for t in 0..m {
+            while g + 1 < good_idx.len() && good_idx[g + 1].abs_diff(t) <= good_idx[g].abs_diff(t) {
+                g += 1;
+            }
+            if (good_idx[g].abs_diff(t) as f32) <= HOLD * lag[t] {
+                moving_rates.push(drift_rate[t]);
+            }
+        }
+        if moving_rates.is_empty() { 0.0 } else { moving_rates.iter().sum::<f32>() / moving_rates.len() as f32 }
+    };
+
     // Skin position (rows) and lateral offset (pixels) of every kept line.
     let mut y = vec![0f32; m];
     let mut xs = vec![0f32; m];
@@ -432,9 +456,14 @@ fn reconstruct_run(lines: &Lines, a: usize, b: usize, bg_pri: &[f32], bg_sec: &[
         }
         let l = lag[t].max(1.0);
         let moving = good_idx[g].abs_diff(t) as f32 <= HOLD * lag[t];
+        let step = match lateral {
+            Lateral::None => 0.0,
+            Lateral::Full => drift_rate[t],
+            Lateral::Detrend => drift_rate[t] - mean_rate,
+        };
         if t + 1 < m {
             y[t + 1] = y[t] + if moving { SEP_ROWS / l } else { 0.0 };
-            xs[t + 1] = xs[t] + if moving { dx[t] / l } else { 0.0 };
+            xs[t + 1] = xs[t] + if moving { step } else { 0.0 };
         }
     }
 
@@ -473,7 +502,7 @@ fn reconstruct_run(lines: &Lines, a: usize, b: usize, bg_pri: &[f32], bg_sec: &[
 /// windows; the contact run yielding the most rows wins. Returns
 /// `(pixels, width, height)`, or `None` without a usable swipe (blank sensor,
 /// or a finger that touched but did not move).
-pub fn reconstruct_swipe(lines: &Lines) -> Option<(Vec<u8>, usize, usize)> {
+pub fn reconstruct_swipe(lines: &Lines, lateral: Lateral) -> Option<(Vec<u8>, usize, usize)> {
     if lines.cols < 264 || lines.rows == 0 {
         return None;
     }
@@ -483,7 +512,7 @@ pub fn reconstruct_swipe(lines: &Lines) -> Option<(Vec<u8>, usize, usize)> {
     let bg_sec = col_median(lines, &all_rows, &sec_cols());
     let best = contact_runs(&lines.contact_sd())
         .into_iter()
-        .filter_map(|(a, b)| reconstruct_run(lines, a, b, &bg_pri, &bg_sec))
+        .filter_map(|(a, b)| reconstruct_run(lines, a, b, &bg_pri, &bg_sec, lateral))
         .max_by_key(|rows| rows.len())?;
     if best.len() < MIN_SWIPE_ROWS {
         return None;
@@ -536,8 +565,8 @@ mod tests {
     #[test]
     fn height_is_independent_of_swipe_speed() {
         // The same 300 rows of skin, swiped at two speeds.
-        let (_, w, slow) = reconstruct_swipe(&swipe_lines(4000, 3000, 0.1)).expect("slow swipe");
-        let (_, _, fast) = reconstruct_swipe(&swipe_lines(4000, 1000, 0.3)).expect("fast swipe");
+        let (_, w, slow) = reconstruct_swipe(&swipe_lines(4000, 3000, 0.1), Lateral::Full).expect("slow swipe");
+        let (_, _, fast) = reconstruct_swipe(&swipe_lines(4000, 1000, 0.3), Lateral::Full).expect("fast swipe");
         assert_eq!(w, PRI_W);
         assert!((270..=315).contains(&slow), "slow swipe height {slow}");
         assert!((270..=315).contains(&fast), "fast swipe height {fast}");
@@ -546,9 +575,9 @@ mod tests {
     #[test]
     fn held_finger_and_blank_are_rejected() {
         // Held still: contact but no motion.
-        assert!(reconstruct_swipe(&swipe_lines(4000, 3000, 0.0)).is_none());
+        assert!(reconstruct_swipe(&swipe_lines(4000, 3000, 0.0), Lateral::Full).is_none());
         // Blank sensor.
-        assert!(reconstruct_swipe(&swipe_lines(7000, 0, 0.0)).is_none());
+        assert!(reconstruct_swipe(&swipe_lines(7000, 0, 0.0), Lateral::Full).is_none());
         assert_eq!(swipe_lines(7000, 0, 0.0).contact_rows(CONTACT_SD), 0);
     }
 }
