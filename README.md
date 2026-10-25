@@ -1,14 +1,24 @@
 # vfs495
 
-An open-source userspace driver for the **Validity VFS495** ("Falcon") swipe
-fingerprint sensor — USB `138a:003f`, as shipped in the HP EliteBook 820 G3 and
-several other 2015-era HP laptops.
+An open-source userspace driver for the **Validity "Falcon" family** of swipe
+fingerprint sensors, as shipped in 2010s-era HP laptops:
+
+| Model | USB ID | Example laptop | Status |
+| --- | --- | --- | --- |
+| VFS495 | `138a:003f` | HP EliteBook 820 G3 | original target |
+| VFS471 | `138a:003c` | HP EliteBook 2760p | added; live-confirmed |
 
 The whole secure session, image capture and decode run in open Rust. There is
 **no proprietary HP code in the session or login path**. Decoded images are fed
 to libfprint's `virtual_image` driver, which makes the sensor usable through
-stock **fprintd / PAM / GDM / `sudo`** with no custom C kernel or libfprint
-driver.
+stock **fprintd / PAM / login manager / `sudo`** with no custom C kernel or
+libfprint driver.
+
+The per-sensor differences (device ID, whether the handshake needs a client
+certificate, the command sequence, calibration, imaging gate, reconstruction)
+live in one place — [`src/device.rs`](src/device.rs) — and the right profile is
+chosen automatically from the USB ID (or `--device <model>`). Per-model runtime
+data lives in `data/<model>/` (see [`data/README.md`](data/README.md)).
 
 > Status: research driver. The open secure session, transport, AES-256-CBC image
 > decryption, decode and reconstruction all run in open Rust and are
@@ -42,7 +52,7 @@ See [`NOTES.md`](NOTES.md) for the full reverse-engineering log and evidence.
 
 ```
  USB (rusb)                                    libfprint
- 138a:003f                                     virtual_image
+ 138a:003c/3f                                  virtual_image
     │                                              ▲
     ▼                                              │  <i32 w><i32 h><pixels>
  init replay ─► open SSLv3 handshake ─► capture ─► DLI decode ─► feed socket
@@ -76,19 +86,18 @@ cargo build --release
 
 ## Runtime data you must supply
 
-Two things are intentionally **not** distributed with this repo:
+Everything device-specific — firmware patch blobs, the sensor's RSA key, the
+command sequences, the descramble table, and (VFS471) the client certificate and
+key — is derived from HP's proprietary driver and is **not** distributed with
+this repo. You extract it yourself into `data/<model>/`:
 
-1. **Firmware patch blobs** (`vendor/patches/*.bin`). The sensor needs a set of
-   firmware "patches" uploaded to its RAM during init. These are HP's
-   intellectual property and are extracted from HP's own Linux driver package
-   (`rpm2cpio`/`cpio`). This is the same accepted compromise every open Validity
-   driver makes. The file names expected are listed in
-   [`captures/init_seq.json`](captures/init_seq.json).
+- Drop an HP package into `vendor/hp/<model>/` (both gitignored).
+- Run the tooling in [`tools/`](tools/) to produce `data/<model>/`.
 
-2. **Your sensor's RSA public key** (`captures/modulus.json`). A per-device
-   value; the one committed here is for the author's unit. (Parsing it from the
-   sensor's `Certificate` message at handshake time is a planned enhancement so
-   the driver is device-portable out of the box.)
+See [`data/README.md`](data/README.md) for the file list and
+[`tools/README.md`](tools/README.md) for the extraction steps. This is the same
+accepted compromise every open Validity driver makes (the firmware patches are
+HP's and cannot be redistributed).
 
 ## Usage
 
@@ -109,7 +118,7 @@ vfs495 decode --input capture.bin --out fingerprint.pgm    # unpack + descramble
 #   add --feed to write the image exactly as it is fed to libfprint (1.5x enlarged)
 
 # ...or reconstruct from already-descrambled scan lines (fully-open, verifiable offline):
-vfs495 decode-lines --input captures/lines.raw --out fingerprint.pgm
+vfs495 decode-lines --input lines.raw --out fingerprint.pgm
 
 # 5. End-to-end: hand a live swipe to libfprint's virtual_image
 FP_VIRTUAL_IMAGE=/run/user/$(id -u)/vfs495.sock

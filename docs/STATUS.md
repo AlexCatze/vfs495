@@ -17,6 +17,21 @@ reconstructed at true scale from the sensor's second sensing line (session 11, H
 method), and **live enroll + verify passes** (2026-10-04; every pair of that run's
 six swipes matches, mean score 84 — §0).
 
+**Image quality (2026-10-25):** the swipe reconstruction was shearing the print ~30°
+and cropping it (grey wedge), which hurt matching. Cause: `reconstruct_swipe` integrated
+a biased per-line lateral drift into a cumulative sideways shift. The raw decode itself
+is straight and full (decode is correct). Fix: `VFS_LATERAL` (default `none`) drops the
+lateral shift; prints now reconstruct upright, full-width and consistent swipe-to-swipe.
+Re-enroll to benefit. See NOTES.md 2026-10-25.
+
+**VFS471 port (2026-10-25):** this tree now drives the VFS471 (`138a:003c`). Its
+in-session sequence must be the 471's own (`scripts/build_seq471.py`, from a decrypted
+HP 471 trace): the 495 sequence's `0x06` patches reboot the 471 off USB, which was the
+whole "imaging-latch re-enumeration". With 471 patches: no re-enumeration, prepare ~5 s,
+~1.5–2 s per swipe; imaging is finger-gated by the sensor after `0x17`; a wedged sensor
+(init refused / `2604`) is cleared with a USB port reset (HP's `palSensorHWReset`);
+runtime calibration does not fit the 471 (`VFS_NO_CALIB=1`). Details: NOTES.md 2026-10-25.
+
 ---
 
 ## 0. Resume here (session 11, 2026-10-03)

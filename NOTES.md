@@ -1750,3 +1750,135 @@ closes, reconnects for the next scan (waits up to 3 s for one), and sends the cl
 commands when nothing wants a finger any more (max 30 windows per request). The LED is lit
 ~3 s out of every ~4 s after the initial ~9 s. `arm_capture` (used by `run`, `capture`,
 `ridge-probe`, live_enroll.py) still replays the whole recorded sequence.
+
+## 2026-10-25 — VFS471: re-enumeration and "hung sensor" root causes, fixed
+
+### Re-enumeration = we were sending the VFS495's firmware patches
+`captures/capture_seq.json` was still the **VFS495** in-session sequence (its sweep
+lengths 2711/2503/2516/2742/2612/2625/2666 are the 495's, session 10). Its `0x02`
+sensor programs are byte-identical on the 471, but its `0x06` patches are 495 patches
+(405/2581/1301 B — 1301 is the 495's own init patch 1). The 471 reboots off USB on each
+one: 6 re-enumerations per prepare (~25 s with re-handshakes), 1 per swipe window.
+
+Evidence: decrypted HP's own 471 session (`dump/cv2/usb.log` + `DUMP_MASTER` from the
+same run; every client MAC verifies). HP sends 471 patches — patch A 1845 B (x2),
+calibration patch 2629 B, init patch 1 1813 B (== `patch_1_06_1813.bin`), all acked
+`0000` — runs init+handshake+calibration in 1.4 s, and never re-enumerates. The 471
+also re-runs the PgaOffset sweep (8 sweeps, not 7) and its calibration results differ
+from the 495's (PgaOffset 0, Adc 0x86 in sweeps / 0x80 in polls, PgaGain 7/7, plus
+`0x30042190`=1 and `0x300421a0`=3, which are 0 on the 495).
+
+Fix: `scripts/build_seq471.py` builds a 471 sequence in the same 28 slots (0..16 HP 471
+verbatim — HP does not send the in-session `1f05`, the extra sweep takes its place, so
+indices 8 and 11..27 are unchanged; 17..20 = 1a, init patch 1, 1a, patch A; 21..27 = the
+recorded poll/imaging/latch commands with every calibration override copied from HP's
+471 poll). The old file is kept as `captures/capture_seq.vfs495.json`.
+
+Live (no finger and with swipes): **0 USB disconnects** across whole sessions; every
+command `0x0000`/`0x0412`; prepare 4.6–5.7 s (was ~23 s); a swipe window 1.3–2.1 s
+(was ~6 s); 7/8 windows gave swipes (900–2000 contact rows, 200x160–200x590).
+
+### Imaging is finger-gated by the sensor on the 471
+With the right patch A loaded, nothing streams after the imaging `0x02`; the burst
+follows the `0x17` (GetFingerState) and only while a finger is on the sensor (no finger:
+nothing within 5 s, every time). `0x17` payload byte 0 is `02` with a finger, `00`
+without. So the window now waits up to `VFS_SWIPE_WAIT_MS` (5000) after that `0x17`
+and the LED stays lit until the burst ends (it used to go off as `0x17` was sent).
+`prepare()` does not wait in the recorded first window (its image is discarded).
+
+### Speed: per-command overhead
+Each command also waited 3 x 200 ms for extra reply records (HP's trace: always one)
+and 180 ms for EP2 silence even after commands that never stream. Now: one 5 ms peek
+for a straggler; one quiet read after non-`0x02` commands that left EP2 silent.
+
+### "Hung" sensor (2604) = refused init, recovered with HP's USB port reset
+In the wedged state the sensor answers every init step with an error (`06` patch 0 ->
+`0469`, `1f05` -> `046d`, `06` patch 1 -> `044f`), then ClientHello -> `2604`, and refuses
+the soft reset `05 0a 00` (`0404`, from `scsSensorSendReset_V4`). `replay_init` ignored
+the statuses, so this surfaced late as a "short ServerHello". Seen: after a session that
+was never closed (process killed), and also after ~1 min idle following a cleanly closed
+capture session (not after closed handshake-only sessions 3 s apart). It clears by
+itself after some minutes. HP's hardware reset is `palSensorHWReset` -> ioctl
+`0x938ae014` -> `usb_reset`; a libusb `reset_device()` clears it every time (live, 3/3).
+Now: init checks patch acks, `session::open_session` USB-resets and retries once on
+`Wedged`, every CLI command sends `close_notify` on exit (HP does after every session),
+and a write error only counts as a reboot if the device actually left the bus (bus
+address changed); otherwise EP1 OUT is un-stalled and the command resent in-session.
+
+### Runtime calibration is not valid on the 471
+With calibration on, PgaOffset and Adc reject the 471 sweep frames ("unusable sweep
+frame") and PgaGain computes 6 vs HP's 7. Keep `VFS_NO_CALIB=1` (as the service does);
+the replayed values are now the 471's own, from HP's 471 run.
+
+## 2026-10-25 — Image quality: reconstruction sheared/cropped the print (FIXED)
+
+User reported poor matching and "rotated", partial prints. Captured 10 real swipes
+(`window-test --count 10 --dump`, new flag) and compared, per swipe, the raw decode
+(`decode --no-crop`, 264-wide stacked lines) against the IR reconstruction
+(`reconstruct_swipe`):
+
+- **Raw decode is excellent and laterally straight** — clear whorl cores, horizontal
+  ridges, full width on both primary (0..200) and secondary (200..264) lines. So the
+  EP2 decode/descramble is correct; the earlier "rotation/crop" is NOT a decode or
+  sensor problem.
+- **The reconstruction sheared the print ~30–40° and left a grey wedge** (apparent
+  crop). Root cause: `reconstruct_swipe` integrates the per-line lateral drift
+  `dx/l` into a cumulative sideways shift (`xs[t+1]=xs[t]+dx[t]/l`). A straight swipe
+  has ~zero real lateral drift, so any DC bias in the `dx` estimate integrates into a
+  linearly growing shift = a shear, and the shift pushes content out of the 200-wide
+  frame (the "crop"/grey wedge).
+
+Fix: `VFS_LATERAL` (default `none`) controls the lateral term — `none` drops the shift
+(best: straight swipes need no lateral correction), `detrend` removes only the DC bias,
+`full` is the old behavior. With `none`, the 10 swipes reconstruct **upright, full-width,
+whorl-centered, minutiae-rich, and consistent swipe-to-swipe** — i.e. matchable. This is
+expected to fix most of the matching imprecision; re-enrollment required.
+
+Also clarified for the user: `ridge-probe`/`arm_capture` fire BOTH imaging windows
+(`SWIPE_WINDOWS=[22,26]`) and concatenate them → two swipe prompts, one stitched image
+with a mid-image seam. The real login path (daemon `window()`) images one window per
+swipe. New: `window-test --dump <dir>` saves each window's decrypted EP2 stream for
+offline `decode` (raw vs. reconstructed) without the sensor.
+
+HP reference (not yet captured): HP's `getprint` writes `raw.bmp` (pre-reconstruction),
+`ir.bmp` (its reconstruction) and `rawIr.bmp` via `fclWriteImageToBmpFile`; a future
+A/B can compare our reconstruction to HP's `ir.bmp`. Given the raw decode is proven
+correct and `none` yields clean upright prints, this is now validation, not a blocker.
+
+## 2026-10-25 — Universal (multi-sensor) refactor for upstreaming
+
+Restructured the single-sensor VFS495 tree into a family driver (VFS495 + VFS471)
+ahead of a PR, and cleaned up the bring-up debris.
+
+### Device profiles (`src/device.rs`)
+All per-sensor differences now live in one `Device` profile, selected by USB PID
+(`usb::detect`) or `--device <model>`:
+- `pid`, `needs_client_cert` (471 yes / 495 no), `calib` (471 Replay / 495 Compute),
+  `lateral` (471 None / 495 Full), `finger_gated` (471 polls 0x17 / 495 free-runs),
+  the `capture_seq` index ranges (prepare/window/swipe/finish), and `settle_ms`.
+- `session::handshake` sends the Certificate + CertificateVerify flight only when
+  `needs_client_cert`; otherwise the plain-RSA CKE flight (the original 495 path).
+- `capture::run` branches the 0x17 finger-poll and the calibration carry-forward on
+  the profile; `swipe::reconstruct_swipe` takes the lateral mode as an argument.
+- The env knobs still override per run: `VFS_NO_CALIB`, `VFS_LATERAL`, `VFS_SETTLE_MS`.
+
+### Per-model data layout
+Runtime data moved from `captures/` + `vendor/patches/` to `data/<model>/`
+(`init_seq.json`, `modulus.json`, `capture_seq.json`, `perm.bin`,
+`patches/`, and for 471 `client_cert.hex`/`client_privkey.json`). `Config::for_device`
+resolves it; `DliConfig::load_main` takes the model dir. All of it is HP-derived and
+gitignored; `data/README.md` documents the layout and `tools/` the extraction (the
+VFS471 `capture_seq` builder moved to `tools/build_capture_seq_vfs471.py`). The
+previously-committed single-sensor data files were untracked.
+
+### Cleanup
+Removed the dead bring-up experiments and debug logging: `VFS_HP_RESUME` +
+`RESET_SKIPPED`, `VFS_NO_REHANDSHAKE`, `VFS_SKIP_17`, `VFS_REOPEN_SETCONFIG`,
+`VFS_NO_WAIT_DISCONNECT`, `VFS_SWIPE_DEBUG`, all the `[DEBUG-rss]` and `DRV ...`
+logs, and the hardcoded PID. Per-command/handshake chatter dropped to `log::debug!`.
+
+### Status
+VFS471 re-verified live after the refactor: auto-detected, wedge-recovered, 8/8
+swipes, 0 USB re-enumerations, upright full-quality images from `data/vfs471/`.
+**VFS495 is restored from its original committed code/values but is NOT tested here
+(no 495 hardware)** — its profile reproduces the pre-refactor 495 behavior.
