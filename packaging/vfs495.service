@@ -6,11 +6,10 @@ Documentation=https://github.com/hammadmajid/vfs495
 # Idle until fprintd is waiting for a finger, then capture a swipe and feed it.
 # The sensor model (and its calibration/settle defaults) is auto-detected from USB.
 ExecStart=/usr/local/bin/vfs495 --base /usr/local/share/vfs495 daemon --fprintd --socket /var/lib/fprint/vfs495.sock
-# Caps Lock LED lights while the sensor is recording: swipe then.
-Environment=VFS_CUE_LED=capslock
+# Set VFS_CUE_LED=capslock to light the Caps Lock LED while the sensor records.
 Environment=RUST_LOG=warn,vfs495=info,vfs495::capture=warn,vfs495::session=warn
 Restart=on-failure
-RestartSec=60
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
