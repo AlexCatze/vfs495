@@ -8,11 +8,22 @@ cd "$(dirname "$0")/.."
 [ -x target/release/vfs495 ] || { echo "build first: cargo build --release"; exit 1; }
 
 install -D -m 0755 target/release/vfs495 /usr/local/bin/vfs495
-install -d -m 0700 /usr/local/share/vfs495/captures /usr/local/share/vfs495/vendor/patches
-for f in capture_seq.json init_seq.json modulus.json perm_264.bin dli_config.json; do
-    install -m 0600 "captures/$f" "/usr/local/share/vfs495/captures/$f"
+# Install every populated per-model data dir (data/<model>/ is gitignored and
+# generated with tools/ — see data/README.md). The daemon picks the model by USB ID.
+installed_any=0
+for d in data/*/; do
+    [ -f "$d/capture_seq.json" ] || continue
+    model=$(basename "$d")
+    install -d -m 0700 "/usr/local/share/vfs495/data/$model/patches"
+    for f in "$d"*.json "$d"*.hex "$d"*.bin; do
+        [ -f "$f" ] && install -m 0600 "$f" "/usr/local/share/vfs495/data/$model/$(basename "$f")"
+    done
+    for f in "$d"patches/*; do
+        [ -f "$f" ] && install -m 0600 "$f" "/usr/local/share/vfs495/data/$model/patches/$(basename "$f")"
+    done
+    installed_any=1
 done
-install -m 0600 vendor/patches/* /usr/local/share/vfs495/vendor/patches/
+[ "$installed_any" = 1 ] || { echo "no populated data/<model>/ found — run tools/ first (see data/README.md)"; exit 1; }
 chmod 0700 /usr/local/share/vfs495
 install -D -m 0644 packaging/vfs495.service /etc/systemd/system/vfs495.service
 install -D -m 0644 packaging/fprintd-vfs495.conf /etc/systemd/system/fprintd.service.d/vfs495.conf

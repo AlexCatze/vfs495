@@ -1,15 +1,16 @@
 [Unit]
-Description=VFS495 fingerprint sensor feeder (open driver -> libfprint virtual_image)
+Description=Validity fingerprint sensor feeder (open driver -> libfprint virtual_image)
 Documentation=https://github.com/hammadmajid/vfs495
 
 [Service]
-# Idle until fprintd is waiting for a finger, then capture one swipe and feed it.
+# Idle until fprintd is waiting for a finger, then capture a swipe and feed it.
+# The sensor model (and its calibration/settle defaults) is auto-detected from USB.
 ExecStart=/usr/local/bin/vfs495 --base /usr/local/share/vfs495 daemon --fprintd --socket /var/lib/fprint/vfs495.sock
 # Caps Lock LED lights while the sensor is recording: swipe then.
 Environment=VFS_CUE_LED=capslock
 Environment=RUST_LOG=warn,vfs495=info,vfs495::capture=warn,vfs495::session=warn
 Restart=on-failure
-RestartSec=5
+RestartSec=60
 
 [Install]
 WantedBy=multi-user.target

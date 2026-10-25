@@ -46,3 +46,15 @@ captures/capture_seq.json
 # HP calibration traces + sweep-frame dumps (device data)
 captures/calib_trace*.txt
 captures/calib_frames/
+
+# ---- Universal (multi-sensor) layout ----
+# Per-model runtime data is ALL HP-derived (firmware patches, the sensor's RSA
+# key, the extracted client cert/key, descramble table, command sequences).
+# Generate it with tools/ from HP's package; never commit it. The committed
+# data/README.md documents the layout.
+/data/*/
+# HP's proprietary package and anything dropped in to extract from.
+/vendor/
+
+# Legacy single-sensor data dir — superseded by data/<model>/; all HP-derived/dev
+/captures/
